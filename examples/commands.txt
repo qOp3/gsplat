@@ -1,0 +1,18 @@
+MAX_JOBS=4 CUDA_VISIBLE_DEVICES=0 python -m examples.simple_trainer default \
+  --data_dir data/grape \
+  --data_factor 4 \
+  --result_dir results/grape_progressive \
+  --max_steps 30000 \
+  --packed \
+  --progressive \
+  --stage_steps 5000 17000 27000 \
+  --coarse_init_scale_mult 2.5 \
+  --mid_spawn_scale_mult 0.6 \
+  --fine_spawn_scale_mult 0.25 \
+  --coarse_ssim_lambda 0.10 \
+  --mid_ssim_lambda 0.20 \
+  --fine_ssim_lambda 0.25 \
+  --fine_absgrad \
+  --fine_grow_grad2d 0.0008 \
+  --band_range_reg 0.01 \
+  --no-normalize_world_space

@@ -22,7 +22,10 @@ tensorboard
 tensorly
 pyyaml
 matplotlib
-git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5
+# Optional SSIM speedup. gsplat.losses.ssim_loss falls back to a pure PyTorch
+# implementation when fused_ssim is unavailable, and this extension can fail to
+# build with newer host compilers than the installed CUDA supports.
+# git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5
 git+https://github.com/harry7557558/fused-bilagrid@49f0ef06c9f81810fb9b5dd9027cf1844950cc16
 splines
 ppisp @ git+https://github.com/nv-tlabs/ppisp@v1.0.0

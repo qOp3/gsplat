@@ -18,10 +18,41 @@ import json
 import math
 import os
 import time
+import copy
+import importlib.util
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+EXAMPLES_DIR = Path(__file__).resolve().parent
+for path in (REPO_ROOT, EXAMPLES_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+
+def _alias_local_package(package_name: str, package_root: Path) -> None:
+    if package_name in sys.modules:
+        return
+    init_file = package_root / "__init__.py"
+    if not init_file.exists():
+        return
+    spec = importlib.util.spec_from_file_location(
+        package_name,
+        init_file,
+        submodule_search_locations=[str(package_root)],
+    )
+    if spec is None or spec.loader is None:
+        return
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[package_name] = module
+    spec.loader.exec_module(module)
+
+
+_alias_local_package("gsplat_scene", REPO_ROOT / "libs" / "scene")
+_alias_local_package("gsplat_stage", REPO_ROOT / "libs" / "stage")
 
 import imageio
 import numpy as np
@@ -156,6 +187,31 @@ class Config:
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
 
+    # Progressive multi-scale training mode.
+    progressive: bool = False
+    stage_steps: Tuple[int, int, int] = (5000, 17000, 27000)
+    coarse_init_scale_mult: float = 2.5
+    mid_spawn_scale_mult: float = 0.6
+    fine_spawn_scale_mult: float = 0.25
+    coarse_ssim_lambda: float = 0.10
+    mid_ssim_lambda: float = 0.20
+    fine_ssim_lambda: float = 0.25
+    coarse_res_scale: float = 0.67
+    mid_res_scale: float = 0.75
+    fine_res_scale: float = 1.0
+    freeze_policy: str = "geometry_and_opacity"
+    fine_absgrad: bool = True
+    fine_grow_grad2d: float = 0.0008
+    band_range_reg: float = 0.01
+    overlap_reg: float = 0.0
+    band_caps: Tuple[int, int, int] = (300000, 400000, 400000)
+    spawn_topk: int = 50000
+    child_init_opa: float = 0.05
+    spawn_score_alpha: float = 1.0
+    spawn_score_beta: float = 0.5
+    spawn_score_gamma: float = 0.1
+    spawn_window: int = 3
+
     # Near plane clipping distance
     near_plane: float = 0.01
     # Far plane clipping distance
@@ -271,6 +327,46 @@ class Config:
             assert_never(strategy)
 
 
+PROGRESSIVE_BANDS = ("coarse", "mid", "fine")
+
+
+def get_progressive_stage(step: int, cfg: Config) -> str:
+    if step < cfg.stage_steps[0]:
+        return "coarse"
+    elif step < cfg.stage_steps[1]:
+        return "mid"
+    elif step < cfg.stage_steps[2]:
+        return "fine"
+    else:
+        return "polish"
+
+
+def create_optimizers_for_splats(
+    splats: torch.nn.ParameterDict,
+    lrs: Dict[str, float],
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    batch_size: int = 1,
+    world_size: int = 1,
+) -> Dict[str, torch.optim.Optimizer]:
+    BS = batch_size * world_size
+    if sparse_grad:
+        optimizer_class = torch.optim.SparseAdam
+    elif visible_adam:
+        optimizer_class = SelectiveAdam
+    else:
+        optimizer_class = torch.optim.Adam
+    return {
+        name: optimizer_class(
+            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+            eps=1e-15 / math.sqrt(BS),
+            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            fused=True,
+        )
+        for name, lr in lrs.items()
+    }
+
+
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -343,24 +439,14 @@ def create_splats_with_optimizers(
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
-    BS = batch_size * world_size
-    optimizer_class = None
-    if sparse_grad:
-        optimizer_class = torch.optim.SparseAdam
-    elif visible_adam:
-        optimizer_class = SelectiveAdam
-    else:
-        optimizer_class = torch.optim.Adam
-    optimizers = {
-        name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
-        )
-        for name, _, lr in params
-    }
+    optimizers = create_optimizers_for_splats(
+        splats,
+        {name: lr for name, _, lr in params},
+        sparse_grad=sparse_grad,
+        visible_adam=visible_adam,
+        batch_size=batch_size,
+        world_size=world_size,
+    )
     return splats, optimizers
 
 
@@ -462,6 +548,12 @@ class Runner:
             raise ValueError(
                 f"PPISP post-processing requires MCMCStrategy at the moment."
             )
+        if cfg.progressive and not isinstance(cfg.strategy, DefaultStrategy):
+            raise ValueError("Progressive training currently supports DefaultStrategy only.")
+        if cfg.progressive and cfg.sparse_grad:
+            raise ValueError("Progressive training does not support sparse_grad yet.")
+        if cfg.progressive and cfg.visible_adam:
+            raise ValueError("Progressive training does not support visible_adam yet.")
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -471,7 +563,8 @@ class Runner:
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,
-            init_scale=cfg.init_scale,
+            init_scale=cfg.init_scale
+            * (cfg.coarse_init_scale_mult if cfg.progressive else 1.0),
             means_lr=cfg.means_lr,
             scales_lr=cfg.scales_lr,
             opacities_lr=cfg.opacities_lr,
@@ -488,6 +581,33 @@ class Runner:
             world_rank=world_rank,
             world_size=world_size,
         )
+        self.progressive_active_band: Optional[str] = None
+        self.progressive_stage: Optional[str] = None
+        self.progressive_absgrad_enabled = False
+        self.progressive_polish_warned = False
+        self.progressive_spawn_scores: Dict[str, Tensor] = {}
+        if cfg.progressive:
+            self.band_splats: Dict[str, torch.nn.ParameterDict] = {
+                "coarse": self.splats
+            }
+            self.band_optimizers: Dict[str, Dict[str, torch.optim.Optimizer]] = {
+                "coarse": self.optimizers
+            }
+            self.band_strategies: Dict[str, DefaultStrategy] = {
+                "coarse": self._make_band_strategy("coarse")
+            }
+            self.band_strategy_state: Dict[str, Dict[str, Any]] = {
+                "coarse": self.band_strategies["coarse"].initialize_state(
+                    scene_scale=self.scene_scale
+                )
+            }
+            self.band_scale_stats: Dict[str, Tuple[float, float]] = {
+                "coarse": self._band_scale_stats(self.band_splats["coarse"])
+            }
+            self.progressive_active_band = "coarse"
+            self.progressive_stage = "coarse"
+            self.splats = self.band_splats["coarse"]
+            self.optimizers = self.band_optimizers["coarse"]
         self.scene = GaussianScene.from_splats(self.splats, id="scene")
         self.splats = self.scene.splats
         self.stage = Stage()
@@ -495,9 +615,16 @@ class Runner:
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
-        self.cfg.strategy.check_sanity(self.splats, self.optimizers)
+        if cfg.progressive:
+            self.band_strategies["coarse"].check_sanity(
+                self.band_splats["coarse"], self.band_optimizers["coarse"]
+            )
+        else:
+            self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy):
+        if cfg.progressive:
+            self.strategy_state = None
+        elif isinstance(self.cfg.strategy, DefaultStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
@@ -621,6 +748,520 @@ class Runner:
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
 
+    def _splat_lrs(self) -> Dict[str, float]:
+        cfg = self.cfg
+        lrs = {
+            "means": cfg.means_lr * self.scene_scale,
+            "scales": cfg.scales_lr,
+            "quats": cfg.quats_lr,
+            "opacities": cfg.opacities_lr,
+        }
+        if cfg.app_opt:
+            lrs["features"] = cfg.sh0_lr
+            lrs["colors"] = cfg.sh0_lr
+        else:
+            lrs["sh0"] = cfg.sh0_lr
+            lrs["shN"] = cfg.shN_lr
+        return lrs
+
+    def _make_band_strategy(self, band: str) -> DefaultStrategy:
+        assert isinstance(self.cfg.strategy, DefaultStrategy)
+        strategy = copy.deepcopy(self.cfg.strategy)
+        if band == "fine" and self.cfg.fine_absgrad:
+            strategy.absgrad = True
+            strategy.grow_grad2d = self.cfg.fine_grow_grad2d
+        if band == "coarse":
+            strategy.grow_scale3d *= self.cfg.coarse_init_scale_mult
+            strategy.prune_scale3d *= self.cfg.coarse_init_scale_mult
+        return strategy
+
+    def _band_scale_stats(
+        self, splats: Union[torch.nn.ParameterDict, Dict[str, Tensor]]
+    ) -> Tuple[float, float]:
+        scales = splats["scales"].detach()
+        return scales.mean().item(), scales.std(unbiased=False).clamp_min(1e-6).item()
+
+    def _band_counts(self) -> Dict[str, int]:
+        if not self.cfg.progressive:
+            return {"total": len(self.splats["means"])}
+        counts = {
+            band: len(self.band_splats[band]["means"])
+            for band in PROGRESSIVE_BANDS
+            if band in self.band_splats
+        }
+        counts["total"] = sum(counts.values())
+        return counts
+
+    def freeze_band(self, band: str, geometry_only: bool = False) -> None:
+        if band not in self.band_splats:
+            return
+        geometry_keys = {"means", "scales", "quats"}
+        if self.cfg.freeze_policy == "geometry_and_opacity":
+            geometry_keys.add("opacities")
+        for name, param in self.band_splats[band].items():
+            if not geometry_only or name in geometry_keys:
+                param.requires_grad = False
+                param.grad = None
+
+    def unfreeze_band(self, band: str, appearance_only: bool = False) -> None:
+        if band not in self.band_splats:
+            return
+        appearance_keys = {"sh0", "shN", "colors", "features"}
+        for name, param in self.band_splats[band].items():
+            param.requires_grad = (name in appearance_keys) if appearance_only else True
+
+    def build_merged_splats(
+        self, active_band: Optional[str]
+    ) -> Tuple[Dict[str, Tensor], Dict[str, slice]]:
+        assert self.cfg.progressive
+        existing_bands = [band for band in PROGRESSIVE_BANDS if band in self.band_splats]
+        assert existing_bands, "Progressive rendering requires at least one band."
+        keys = list(self.band_splats[existing_bands[0]].keys())
+        merged: Dict[str, Tensor] = {}
+        band_slices: Dict[str, slice] = {}
+        offset = 0
+        for band in existing_bands:
+            splats = self.band_splats[band]
+            assert set(splats.keys()) == set(keys), (
+                f"Band {band} keys {set(splats.keys())} do not match {set(keys)}."
+            )
+            n = splats["means"].shape[0]
+            for key in keys:
+                assert splats[key].shape[0] == n, (
+                    f"Band {band} key {key} has mismatched first dimension."
+                )
+            band_slices[band] = slice(offset, offset + n)
+            offset += n
+
+        for key in keys:
+            tensors = []
+            for band in existing_bands:
+                value = self.band_splats[band][key]
+                tensors.append(value if band == active_band else value.detach())
+            merged[key] = torch.cat(tensors, dim=0)
+        return merged, band_slices
+
+    def refresh_progressive_scene(self, active_band: Optional[str]) -> None:
+        if not self.cfg.progressive:
+            return
+        self.progressive_active_band = active_band
+        self.splats, self.progressive_band_slices = self.build_merged_splats(
+            active_band=active_band
+        )
+        self.scene.splats = self.splats
+
+    @torch.no_grad()
+    def _sample_residual_at_centers(
+        self,
+        residual_map: Tensor,
+        centers: Tensor,
+        valid: Tensor,
+        width: int,
+        height: int,
+    ) -> Tensor:
+        scores = torch.zeros(centers.shape[0], device=centers.device)
+        if centers.numel() == 0:
+            return scores
+        xy = centers.detach()
+        if xy.abs().max() <= 2.0:
+            xs = ((xy[:, 0] + 1.0) * 0.5 * (width - 1)).round().long()
+            ys = ((xy[:, 1] + 1.0) * 0.5 * (height - 1)).round().long()
+        else:
+            xs = xy[:, 0].round().long()
+            ys = xy[:, 1].round().long()
+        in_bounds = valid & (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+        if not in_bounds.any():
+            return scores
+        half_window = max(self.cfg.spawn_window // 2, 0)
+        valid_ids = torch.where(in_bounds)[0]
+        for idx in valid_ids.tolist():
+            x = xs[idx].item()
+            y = ys[idx].item()
+            x0 = max(0, x - half_window)
+            x1 = min(width, x + half_window + 1)
+            y0 = max(0, y - half_window)
+            y1 = min(height, y + half_window + 1)
+            scores[idx] = residual_map[y0:y1, x0:x1].mean()
+        return scores
+
+    @torch.no_grad()
+    def update_spawn_scores(
+        self,
+        band: str,
+        colors: Tensor,
+        pixels: Tensor,
+        info: Dict[str, Any],
+    ) -> None:
+        if band not in self.band_splats:
+            return
+        band_slice = self.progressive_band_slices[band]
+        start = 0 if band_slice.start is None else band_slice.start
+        end = band_slice.stop
+        assert end is not None
+        active_n = end - start
+        height, width = pixels.shape[1:3]
+        residual_map = l1_loss(colors.detach(), pixels.detach()).mean(dim=-1)[0]
+        residual_score = torch.zeros(active_n, device=colors.device)
+        gradient_score = torch.zeros(active_n, device=colors.device)
+
+        means2d = info.get("means2d")
+        radii = info.get("radii")
+        if isinstance(means2d, torch.Tensor) and isinstance(radii, torch.Tensor):
+            grad_source = None
+            if hasattr(means2d, "absgrad") and means2d.absgrad is not None:
+                grad_source = means2d.absgrad
+            elif means2d.grad is not None:
+                grad_source = means2d.grad
+
+            if self.cfg.packed:
+                gids = info["gaussian_ids"]
+                mask = (gids >= start) & (gids < end)
+                if mask.any():
+                    local_ids = gids[mask] - start
+                    centers = means2d[mask]
+                    visible = (radii[mask] > 0.0).all(dim=-1)
+                    sampled = self._sample_residual_at_centers(
+                        residual_map, centers, visible, width, height
+                    )
+                    counts = torch.zeros(active_n, device=colors.device)
+                    residual_score.index_add_(0, local_ids, sampled)
+                    counts.index_add_(0, local_ids, torch.ones_like(sampled))
+                    residual_score = residual_score / counts.clamp_min(1.0)
+                    if grad_source is not None:
+                        grad_norm = grad_source[mask].norm(dim=-1)
+                        grad_counts = torch.zeros(active_n, device=colors.device)
+                        gradient_score.index_add_(0, local_ids, grad_norm)
+                        grad_counts.index_add_(0, local_ids, torch.ones_like(grad_norm))
+                        gradient_score = gradient_score / grad_counts.clamp_min(1.0)
+            else:
+                centers = means2d[..., start:end, :].reshape(-1, active_n, 2)[0]
+                visible = (radii[..., start:end, :] > 0.0).all(dim=-1).reshape(
+                    -1, active_n
+                )[0]
+                residual_score = self._sample_residual_at_centers(
+                    residual_map, centers, visible, width, height
+                )
+                if grad_source is not None:
+                    gradient_score = grad_source[..., start:end, :].norm(dim=-1)
+                    gradient_score = gradient_score.reshape(-1, active_n).mean(dim=0)
+
+        opacity_score = torch.sigmoid(self.band_splats[band]["opacities"].detach())
+        if opacity_score.numel() != active_n:
+            return
+        score = (
+            self.cfg.spawn_score_alpha * residual_score
+            + self.cfg.spawn_score_beta * gradient_score
+            + self.cfg.spawn_score_gamma * opacity_score.flatten()
+        )
+        self.progressive_spawn_scores[band] = torch.nan_to_num(score.detach(), nan=0.0)
+
+    @torch.no_grad()
+    def spawn_band_from_parent(
+        self, new_band: str, parent_band: str, scale_mult: float
+    ) -> None:
+        if new_band in self.band_splats:
+            return
+        parent = self.band_splats[parent_band]
+        parent_n = parent["means"].shape[0]
+        cap = self.cfg.band_caps[PROGRESSIVE_BANDS.index(new_band)]
+        child_n = min(parent_n, self.cfg.spawn_topk, cap)
+        if child_n <= 0:
+            raise ValueError(f"Cannot spawn {new_band}: parent {parent_band} is empty.")
+
+        opacities = torch.sigmoid(parent["opacities"].detach()).flatten()
+        spawn_scores = self.progressive_spawn_scores.get(parent_band)
+        if spawn_scores is not None and spawn_scores.numel() == parent_n:
+            scores = spawn_scores.to(opacities.device)
+            score_source = "residual_grad_opacity"
+        elif opacities.numel() == parent_n:
+            scores = opacities
+            score_source = "opacity"
+        else:
+            scores = torch.ones(parent_n, device=opacities.device)
+            score_source = "uniform"
+        scores = torch.nan_to_num(scores, nan=0.0)
+
+        if child_n < parent_n:
+            _, sel = torch.topk(scores, k=child_n, largest=True, sorted=False)
+        else:
+            sel = torch.arange(parent_n, device=opacities.device)
+
+        child = torch.nn.ParameterDict()
+        for key, value in parent.items():
+            cloned = value.detach()[sel].clone()
+            if key == "means":
+                jitter = torch.randn_like(cloned) * torch.exp(parent["scales"].detach()[sel]) * 0.25
+                cloned = cloned + jitter
+            elif key == "scales":
+                cloned = cloned + math.log(scale_mult)
+            elif key == "opacities":
+                child_logit = torch.logit(
+                    torch.tensor(self.cfg.child_init_opa, device=cloned.device)
+                ).item()
+                cloned = torch.full_like(cloned, child_logit)
+            child[key] = torch.nn.Parameter(cloned, requires_grad=True)
+
+        self.band_splats[new_band] = child
+        self.band_optimizers[new_band] = create_optimizers_for_splats(
+            child,
+            self._splat_lrs(),
+            sparse_grad=False,
+            visible_adam=self.cfg.visible_adam,
+            batch_size=self.cfg.batch_size,
+            world_size=self.world_size,
+        )
+        self.band_strategies[new_band] = self._make_band_strategy(new_band)
+        self.band_strategies[new_band].check_sanity(
+            self.band_splats[new_band], self.band_optimizers[new_band]
+        )
+        self.band_strategy_state[new_band] = self.band_strategies[
+            new_band
+        ].initialize_state(scene_scale=self.scene_scale)
+        self.band_scale_stats[new_band] = self._band_scale_stats(child)
+        selected_scores = scores[sel]
+        print(
+            f"[Progressive] Spawned {new_band} from {parent_band}: "
+            f"{child_n} splats, scale_mult={scale_mult}, "
+            f"score_source={score_source}, "
+            f"score_mean={selected_scores.mean().item():.6f}, "
+            f"score_max={selected_scores.max().item():.6f}"
+        )
+
+    def prepare_progressive_stage(self, step: int) -> Tuple[str, str]:
+        stage = get_progressive_stage(step, self.cfg)
+        active_band = "fine" if stage == "polish" else stage
+        if stage == "mid" and "mid" not in self.band_splats:
+            self.freeze_band("coarse")
+            self.spawn_band_from_parent("mid", "coarse", self.cfg.mid_spawn_scale_mult)
+        elif stage == "fine" and "fine" not in self.band_splats:
+            self.freeze_band("coarse")
+            self.freeze_band("mid")
+            parent = "mid" if "mid" in self.band_splats else "coarse"
+            self.spawn_band_from_parent("fine", parent, self.cfg.fine_spawn_scale_mult)
+        elif stage == "polish":
+            for band in list(self.band_splats.keys()):
+                self.freeze_band(band, geometry_only=True)
+            if not self.progressive_polish_warned:
+                print(
+                    "[Progressive] Polish stage uses appearance-only gradients where "
+                    "available; continuing with the fine band optimizer."
+                )
+                self.progressive_polish_warned = True
+            if "fine" not in self.band_splats:
+                parent = "mid" if "mid" in self.band_splats else "coarse"
+                self.spawn_band_from_parent("fine", parent, self.cfg.fine_spawn_scale_mult)
+            self.unfreeze_band("fine", appearance_only=True)
+
+        if active_band == "mid":
+            self.freeze_band("coarse")
+            self.unfreeze_band("mid")
+        elif active_band == "fine":
+            self.freeze_band("coarse")
+            self.freeze_band("mid")
+            self.unfreeze_band("fine", appearance_only=(stage == "polish"))
+        elif active_band == "coarse":
+            self.unfreeze_band("coarse")
+
+        self.progressive_stage = stage
+        self.progressive_active_band = active_band
+        self.optimizers = self.band_optimizers[active_band]
+        self.progressive_absgrad_enabled = self.band_strategies[active_band].absgrad
+        return stage, active_band
+
+    def progressive_ssim_lambda(self, stage: str) -> float:
+        if stage == "coarse":
+            return self.cfg.coarse_ssim_lambda
+        if stage == "mid":
+            return self.cfg.mid_ssim_lambda
+        return self.cfg.fine_ssim_lambda
+
+    def progressive_res_scale(self, stage: str) -> float:
+        if stage == "coarse":
+            return self.cfg.coarse_res_scale
+        if stage == "mid":
+            return self.cfg.mid_res_scale
+        return self.cfg.fine_res_scale
+
+    def band_range_loss(self, band: str) -> Tensor:
+        if self.cfg.band_range_reg <= 0.0:
+            return self.band_splats[band]["scales"].sum() * 0.0
+        factors = {
+            "coarse": (1.8, 3.0),
+            "mid": (0.6, 1.2),
+            "fine": (0.15, 0.45),
+        }
+        mean_log_scale, _ = self.band_scale_stats[band]
+        lo, hi = factors[band]
+        min_log_scale = mean_log_scale + math.log(lo)
+        max_log_scale = mean_log_scale + math.log(hi)
+        log_scales = self.band_splats[band]["scales"]
+        return (
+            F.relu(min_log_scale - log_scales).mean()
+            + F.relu(log_scales - max_log_scale).mean()
+        )
+
+    def retain_progressive_info_grad(self, info: Dict[str, Any]) -> None:
+        key = self.band_strategies[
+            self.progressive_active_band
+        ].key_for_gradient  # type: ignore[index]
+        assert key in info, f"{key} is required but missing."
+        info[key].retain_grad()
+
+    def filter_info_to_band(
+        self, info: Dict[str, Any], band_slice: slice
+    ) -> Dict[str, Any]:
+        start = 0 if band_slice.start is None else band_slice.start
+        end = band_slice.stop
+        assert end is not None
+        active_n = end - start
+        total_n = self.splats["means"].shape[0]
+        active_info = dict(info)
+        if self.cfg.packed:
+            gids = info["gaussian_ids"]
+            mask = (gids >= start) & (gids < end)
+            active_info["gaussian_ids"] = gids[mask] - start
+            for key, value in info.items():
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.shape[:1] == gids.shape[:1]
+                    and key != "gaussian_ids"
+                ):
+                    active_info[key] = value[mask]
+            gradient_key = self.band_strategies[
+                self.progressive_active_band
+            ].key_for_gradient  # type: ignore[index]
+            if gradient_key in info and info[gradient_key].grad is not None:
+                active_info[gradient_key].grad = info[gradient_key].grad[mask]
+            if (
+                gradient_key in info
+                and hasattr(info[gradient_key], "absgrad")
+                and info[gradient_key].absgrad is not None
+            ):
+                active_info[gradient_key].absgrad = info[gradient_key].absgrad[mask]
+            assert active_info["gaussian_ids"].numel() <= gids.numel()
+            if active_info["gaussian_ids"].numel() > 0:
+                assert int(active_info["gaussian_ids"].min()) >= 0
+                assert int(active_info["gaussian_ids"].max()) < active_n
+            if "radii" in active_info:
+                assert active_info["radii"].shape[0] == active_info["gaussian_ids"].shape[0]
+            if gradient_key in active_info:
+                assert active_info[gradient_key].shape[0] == active_info[
+                    "gaussian_ids"
+                ].shape[0]
+        else:
+            for key in [
+                "means2d",
+                "gradient_2dgs",
+                "radii",
+                "depths",
+                "conics",
+                "opacities",
+            ]:
+                value = info.get(key)
+                if isinstance(value, torch.Tensor) and value.shape[-2] == total_n:
+                    active_info[key] = value[..., start:end, :]
+                    assert active_info[key].shape[-2] == active_n
+            gradient_key = self.band_strategies[
+                self.progressive_active_band
+            ].key_for_gradient  # type: ignore[index]
+            gradient_value = active_info.get(gradient_key)
+            if (
+                isinstance(gradient_value, torch.Tensor)
+                and info[gradient_key].grad is not None
+            ):
+                gradient_value.grad = info[gradient_key].grad[..., start:end, :]
+            if (
+                isinstance(gradient_value, torch.Tensor)
+                and hasattr(info[gradient_key], "absgrad")
+                and info[gradient_key].absgrad is not None
+            ):
+                gradient_value.absgrad = info[gradient_key].absgrad[..., start:end, :]
+            if "radii" in active_info:
+                assert active_info["radii"].shape[-2] == active_n
+            if isinstance(gradient_value, torch.Tensor):
+                assert gradient_value.shape[-2] == active_n
+        return active_info
+
+    def save_progressive_checkpoint(self, step: int, stage: str) -> None:
+        data = {
+            "step": step,
+            "progressive": True,
+            "stage": stage,
+            "bands": {
+                band: self.band_splats[band].state_dict()
+                for band in PROGRESSIVE_BANDS
+                if band in self.band_splats
+            },
+            "cfg": {
+                key: value
+                if isinstance(value, (bool, int, float, str, type(None), list, tuple))
+                else repr(value)
+                for key, value in vars(self.cfg).items()
+            },
+        }
+        if self.cfg.pose_opt:
+            data["pose_adjust"] = (
+                self.pose_adjust.module.state_dict()
+                if self.world_size > 1
+                else self.pose_adjust.state_dict()
+            )
+        if self.cfg.app_opt:
+            data["app_module"] = (
+                self.app_module.module.state_dict()
+                if self.world_size > 1
+                else self.app_module.state_dict()
+            )
+        if self.post_processing_module is not None:
+            data["post_processing"] = self.post_processing_module.state_dict()
+        torch.save(data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt")
+
+    def load_progressive_checkpoint(self, ckpts: List[Dict[str, Any]]) -> None:
+        ckpt = ckpts[0]
+        if ckpt.get("progressive", False):
+            self.band_splats = {}
+            self.band_optimizers = {}
+            self.band_strategies = {}
+            self.band_strategy_state = {}
+            self.band_scale_stats = {}
+            for band, state in ckpt["bands"].items():
+                splats = torch.nn.ParameterDict(
+                    {
+                        key: torch.nn.Parameter(value.to(self.device), requires_grad=True)
+                        for key, value in state.items()
+                    }
+                )
+                self.band_splats[band] = splats
+                self.band_optimizers[band] = create_optimizers_for_splats(
+                    splats,
+                    self._splat_lrs(),
+                    sparse_grad=False,
+                    visible_adam=self.cfg.visible_adam,
+                    batch_size=self.cfg.batch_size,
+                    world_size=self.world_size,
+                )
+                self.band_strategies[band] = self._make_band_strategy(band)
+                self.band_strategy_state[band] = self.band_strategies[
+                    band
+                ].initialize_state(scene_scale=self.scene_scale)
+                self.band_scale_stats[band] = self._band_scale_stats(splats)
+        else:
+            self.band_splats = {"coarse": self.splats}
+            for key in self.splats.keys():
+                self.band_splats["coarse"][key].data = torch.cat(
+                    [old_ckpt["splats"][key] for old_ckpt in ckpts]
+                ).to(self.device)
+            self.band_optimizers = {"coarse": self.optimizers}
+            self.band_strategies = {"coarse": self._make_band_strategy("coarse")}
+            self.band_strategy_state = {
+                "coarse": self.band_strategies["coarse"].initialize_state(
+                    scene_scale=self.scene_scale
+                )
+            }
+            self.band_scale_stats = {
+                "coarse": self._band_scale_stats(self.band_splats["coarse"])
+            }
+        self.refresh_progressive_scene(active_band=None)
+
     def freeze_gaussians(self):
         """Freeze all Gaussian parameters for controller distillation.
 
@@ -715,7 +1356,9 @@ class Runner:
             height=height,
             packed=self.cfg.packed,
             absgrad=(
-                self.cfg.strategy.absgrad
+                self.progressive_absgrad_enabled
+                if self.cfg.progressive
+                else self.cfg.strategy.absgrad
                 if isinstance(self.cfg.strategy, DefaultStrategy)
                 else False
             ),
@@ -842,6 +1485,10 @@ class Runner:
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
+            stage = None
+            active_band = None
+            if cfg.progressive:
+                stage, active_band = self.prepare_progressive_stage(step)
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -878,6 +1525,30 @@ class Runner:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
+            if cfg.progressive:
+                assert stage is not None
+                res_scale = self.progressive_res_scale(stage)
+                if res_scale != 1.0:
+                    pixels = F.interpolate(
+                        pixels.permute(0, 3, 1, 2),
+                        scale_factor=res_scale,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).permute(0, 2, 3, 1)
+                    Ks = Ks.clone()
+                    Ks[:, :2, :] *= res_scale
+                    if masks is not None:
+                        masks = (
+                            F.interpolate(
+                                masks[:, None].float(),
+                                size=pixels.shape[1:3],
+                                mode="nearest",
+                            )[:, 0]
+                            > 0.5
+                        )
+                    if cfg.depth_loss:
+                        points = points * res_scale
+
             height, width = pixels.shape[1:3]
 
             if cfg.pose_noise:
@@ -888,6 +1559,9 @@ class Runner:
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+            if cfg.progressive:
+                assert active_band is not None
+                self.refresh_progressive_scene(active_band=active_band)
 
             # forward
             renders, alphas, info = self.stage.render(
@@ -915,13 +1589,17 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
+            if cfg.progressive and stage != "polish":
+                assert active_band is not None
+                self.retain_progressive_info_grad(info)
+            elif not cfg.progressive:
+                self.cfg.strategy.step_pre_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                )
 
             # loss
             if masks is not None:
@@ -938,7 +1616,12 @@ class Runner:
             ssimloss = ssim_loss(
                 colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
             )
-            loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+            ssim_lambda = (
+                self.progressive_ssim_lambda(stage)
+                if cfg.progressive and stage is not None
+                else cfg.ssim_lambda
+            )
+            loss = torch.lerp(l1loss, ssimloss, ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -971,11 +1654,27 @@ class Runner:
 
             # regularizations
             if cfg.opacity_reg > 0.0:
-                loss += cfg.opacity_reg * opacity_reg_loss(self.splats["opacities"])
+                reg_splats = (
+                    self.band_splats[active_band]
+                    if cfg.progressive and active_band is not None
+                    else self.splats
+                )
+                loss += cfg.opacity_reg * opacity_reg_loss(reg_splats["opacities"])
             if cfg.scale_reg > 0.0:
-                loss += cfg.scale_reg * scale_reg_loss(self.splats["scales"])
+                reg_splats = (
+                    self.band_splats[active_band]
+                    if cfg.progressive and active_band is not None
+                    else self.splats
+                )
+                loss += cfg.scale_reg * scale_reg_loss(reg_splats["scales"])
+            band_range = None
+            if cfg.progressive and active_band is not None:
+                band_range = self.band_range_loss(active_band)
+                loss += cfg.band_range_reg * band_range
 
             loss.backward()
+            if cfg.progressive and active_band is not None and stage != "polish":
+                self.update_spawn_scores(active_band, colors, pixels, info)
 
             desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -1000,8 +1699,23 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
-                self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
+                counts = self._band_counts() if cfg.progressive else None
+                self.writer.add_scalar(
+                    "train/num_GS",
+                    counts["total"] if counts is not None else len(self.splats["means"]),
+                    step,
+                )
                 self.writer.add_scalar("train/mem", mem, step)
+                if cfg.progressive and counts is not None:
+                    for band in PROGRESSIVE_BANDS:
+                        self.writer.add_scalar(
+                            f"train/num_GS_{band}", counts.get(band, 0), step
+                        )
+                    self.writer.add_scalar(
+                        "train/band_range_loss",
+                        band_range.item() if band_range is not None else 0.0,
+                        step,
+                    )
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.post_processing is not None:
@@ -1019,37 +1733,46 @@ class Runner:
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
+                counts = self._band_counts()
                 stats = {
                     "mem": mem,
                     "ellipse_time": time.time() - global_tic,
-                    "num_GS": len(self.splats["means"]),
+                    "num_GS": counts["total"],
                 }
+                if cfg.progressive:
+                    stats.update({f"num_GS_{k}": v for k, v in counts.items() if k != "total"})
+                    stats["stage"] = stage
+                    stats["active_band"] = active_band
                 print("Step: ", step, stats)
                 with open(
                     f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {
-                    "step": step,
-                    "scene_id": self.scene.id,
-                    "splats": self.splats.state_dict(),
-                }
-                if cfg.pose_opt:
-                    if world_size > 1:
-                        data["pose_adjust"] = self.pose_adjust.module.state_dict()
-                    else:
-                        data["pose_adjust"] = self.pose_adjust.state_dict()
-                if cfg.app_opt:
-                    if world_size > 1:
-                        data["app_module"] = self.app_module.module.state_dict()
-                    else:
-                        data["app_module"] = self.app_module.state_dict()
-                if self.post_processing_module is not None:
-                    data["post_processing"] = self.post_processing_module.state_dict()
-                torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
-                )
+                if cfg.progressive:
+                    assert stage is not None
+                    self.save_progressive_checkpoint(step, stage)
+                else:
+                    data = {
+                        "step": step,
+                        "scene_id": self.scene.id,
+                        "splats": self.splats.state_dict(),
+                    }
+                    if cfg.pose_opt:
+                        if world_size > 1:
+                            data["pose_adjust"] = self.pose_adjust.module.state_dict()
+                        else:
+                            data["pose_adjust"] = self.pose_adjust.state_dict()
+                    if cfg.app_opt:
+                        if world_size > 1:
+                            data["app_module"] = self.app_module.module.state_dict()
+                        else:
+                            data["app_module"] = self.app_module.state_dict()
+                    if self.post_processing_module is not None:
+                        data["post_processing"] = self.post_processing_module.state_dict()
+                    torch.save(
+                        data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                    )
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
@@ -1129,7 +1852,38 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
+            if cfg.progressive and stage != "polish":
+                assert active_band is not None
+                counts_before_strategy = self._band_counts()
+                active_info = self.filter_info_to_band(
+                    info, self.progressive_band_slices[active_band]
+                )
+                self.band_strategies[active_band].step_post_backward(
+                    params=self.band_splats[active_band],
+                    optimizers=self.band_optimizers[active_band],
+                    state=self.band_strategy_state[active_band],
+                    step=step,
+                    info=active_info,
+                    packed=cfg.packed,
+                    scene=None,
+                )
+                counts_after_strategy = self._band_counts()
+                for band in PROGRESSIVE_BANDS:
+                    if band != active_band and band in self.band_splats:
+                        assert counts_after_strategy[band] == counts_before_strategy[band], (
+                            f"Frozen band {band} changed during {active_band} "
+                            f"strategy update: {counts_before_strategy[band]} -> "
+                            f"{counts_after_strategy[band]}"
+                        )
+                if world_rank == 0 and step % 100 == 0:
+                    print(
+                        "[Progressive] strategy counts "
+                        f"before={counts_before_strategy} "
+                        f"after={counts_after_strategy}"
+                    )
+            elif cfg.progressive:
+                pass
+            elif isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -1174,6 +1928,18 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
+            if cfg.progressive and world_rank == 0 and step % 100 == 0:
+                counts = self._band_counts()
+                band_counts = ", ".join(
+                    f"{band}={counts.get(band, 0)}" for band in PROGRESSIVE_BANDS
+                )
+                print(
+                    f"[Progressive] step={step} stage={stage} active={active_band} "
+                    f"{band_counts} total={counts['total']} loss={loss.item():.4f} "
+                    f"band_range={band_range.item() if band_range is not None else 0.0:.6f} "
+                    f"absgrad={self.progressive_absgrad_enabled}"
+                )
+
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
@@ -1182,6 +1948,8 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
+        if cfg.progressive:
+            self.refresh_progressive_scene(active_band=None)
 
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
@@ -1252,7 +2020,7 @@ class Runner:
             stats.update(
                 {
                     "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["means"]),
+                    "num_GS": self._band_counts()["total"],
                 }
             )
             if cfg.use_color_correction_metric:
@@ -1284,6 +2052,8 @@ class Runner:
         print("Running trajectory rendering...")
         cfg = self.cfg
         device = self.device
+        if cfg.progressive:
+            self.refresh_progressive_scene(active_band=None)
 
         camtoworlds_all = self.parser.camtoworlds[5:-5]
         if cfg.render_traj_path == "raw":
@@ -1389,7 +2159,10 @@ class Runner:
     def run_compression(self, step: int):
         """Entry for running compression."""
         print("Running compression...")
+        cfg = self.cfg
         world_rank = self.world_rank
+        if self.cfg.progressive:
+            self.refresh_progressive_scene(active_band=None)
 
         compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
         os.makedirs(compress_dir, exist_ok=True)
@@ -1407,6 +2180,8 @@ class Runner:
         self, camera_state: CameraState, render_tab_state: RenderTabState
     ):
         assert isinstance(render_tab_state, GsplatRenderTabState)
+        if self.cfg.progressive:
+            self.refresh_progressive_scene(active_band=None)
         if render_tab_state.preview_render:
             width = render_tab_state.render_width
             height = render_tab_state.render_height
@@ -1436,13 +2211,13 @@ class Runner:
             far_plane=render_tab_state.far_plane,
             radius_clip=render_tab_state.radius_clip,
             eps2d=render_tab_state.eps2d,
-            backgrounds=torch.tensor([render_tab_state.backgrounds], device=self.device)
+            backgrounds=torch.tensor(render_tab_state.backgrounds, device=self.device, dtype=torch.float32)
             / 255.0,
             render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
             rasterize_mode=render_tab_state.rasterize_mode,
             camera_model=render_tab_state.camera_model,
         )  # [1, H, W, 3]
-        render_tab_state.total_gs_count = len(self.splats["means"])
+        render_tab_state.total_gs_count = self._band_counts()["total"]
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
 
         if render_tab_state.render_mode == "rgb":
@@ -1510,12 +2285,15 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             torch.load(file, map_location=runner.device, weights_only=True)
             for file in cfg.ckpt
         ]
-        for k in runner.splats.keys():
-            runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-        runner.scene = GaussianScene.from_splats(runner.splats, id="scene")
-        runner.splats = runner.scene.splats
-        runner.stage = Stage()
-        runner.stage.add_scene(runner.scene, runner.rasterize_splats)
+        if cfg.progressive:
+            runner.load_progressive_checkpoint(ckpts)
+        else:
+            for k in runner.splats.keys():
+                runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+            runner.scene = GaussianScene.from_splats(runner.splats, id="scene")
+            runner.splats = runner.scene.splats
+            runner.stage = Stage()
+            runner.stage.add_scene(runner.scene, runner.rasterize_splats)
         if runner.post_processing_module is not None:
             pp_state = ckpts[0].get("post_processing")
             if pp_state is not None:
