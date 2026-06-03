@@ -16,3 +16,24 @@ MAX_JOBS=4 CUDA_VISIBLE_DEVICES=0 python -m examples.simple_trainer default \
   --fine_grow_grad2d 0.0008 \
   --band_range_reg 0.01 \
   --no-normalize_world_space
+
+
+# 导出各 band 的 PLY 文件
+
+python tools/visualize_bands.py \
+    --ckpt results/garden/ckpts/ckpt_29999_rank0.pt \
+    --output-dir results/garden/bands
+
+# 输出文件：
+#   coarse.ply, mid.ply, fine.ply  -- 每个 band 对应一个 PLY
+#   summary.json                   -- 每个 band 的统计信息（splat 数量、scale、opacity）
+#   scale_histogram.png            -- scale 分布图（需要 matplotlib）
+#   opacity_histogram.png          -- opacity 分布图（需要 matplotlib）
+#   band_counts.png                -- 各 band splat 数量柱状图（需要 matplotlib）
+
+# 参数说明：
+#   --ckpt        checkpoint 路径（必填），支持 progressive 和普通 checkpoint
+#   --output-dir  输出目录，默认 band_visualization
+#   --skip-plots  跳过 matplotlib 图表生成
+
+# 注意：普通（非 progressive）checkpoint 只导出 coarse.ply，内容为全部 splats
