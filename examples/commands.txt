@@ -1,3 +1,29 @@
+# 生成下采样点云（在 gsplat/ 目录下执行）
+# voxel_size 参考：scene 范围 ~50m 时，1.0 保留约 17%，0.5 保留约 60%
+
+# Voxel 下采样（推荐，快速）
+python tools/downsample_pointcloud.py \
+  --data_dir data/grape \
+  --output   data/grape/points_voxel_1.0.ply \
+  --method   voxel \
+  --voxel_size 1.0
+
+# FPS 下采样（均匀性最好，适合小点云）
+python tools/downsample_pointcloud.py \
+  --data_dir data/grape \
+  --output   data/grape/points_fps5k.ply \
+  --method   fps \
+  --n_points 5000
+
+# Random 下采样
+python tools/downsample_pointcloud.py \
+  --data_dir data/grape \
+  --output   data/grape/points_rand10k.ply \
+  --method   random \
+  --n_points 10000
+
+
+# Progressive 训练（完整三阶段）
 MAX_JOBS=4 CUDA_VISIBLE_DEVICES=0 python -m examples.simple_trainer default \
   --data_dir data/grape \
   --data_factor 4 \
@@ -16,6 +42,25 @@ MAX_JOBS=4 CUDA_VISIBLE_DEVICES=0 python -m examples.simple_trainer default \
   --fine_grow_grad2d 0.0008 \
   --band_range_reg 0.01 \
   --no-normalize_world_space
+
+
+# Coarse-only 训练（使用下采样点云 + FFT low-freq 图像）
+MAX_JOBS=4 CUDA_VISIBLE_DEVICES=0 python -m examples.simple_trainer default \
+  --data_dir data/grape \
+  --data_factor 4 \
+  --result_dir results/grape_coarse_fft \
+  --max_steps 30000 \
+  --packed \
+  --progressive \
+  --coarse_only \
+  --coarse_init_ply data/grape/points_voxel_1.0.ply \
+  --train_image_dir data/grape/fft/low_freq \
+  --stage_steps 5000 17000 27000 \
+  --coarse_init_scale_mult 2.5 \
+  --coarse_ssim_lambda 0.10 \
+  --band_range_reg 0.01 \
+  --no-normalize_world_space \
+  --disable_viewer
 
 
 # 导出各 band 的 PLY 文件

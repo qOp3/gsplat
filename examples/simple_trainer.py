@@ -211,6 +211,15 @@ class Config:
     spawn_score_beta: float = 0.5
     spawn_score_gamma: float = 0.1
     spawn_window: int = 3
+    # Stop training after the coarse band stage (requires progressive=True).
+    coarse_only: bool = False
+    # Override training image directory (e.g., point to FFT low-freq output).
+    # Camera poses and 3D points still come from the original data_dir.
+    train_image_dir: Optional[str] = None
+    # PLY file of a pre-downsampled point cloud to use for coarse band init.
+    # When set (and progressive=True), the coarse band is initialized from
+    # this PLY instead of the full COLMAP point cloud.
+    coarse_init_ply: Optional[str] = None
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -554,6 +563,20 @@ class Runner:
             raise ValueError("Progressive training does not support sparse_grad yet.")
         if cfg.progressive and cfg.visible_adam:
             raise ValueError("Progressive training does not support visible_adam yet.")
+        if cfg.coarse_only and not cfg.progressive:
+            raise ValueError("coarse_only=True requires progressive=True.")
+
+        if cfg.train_image_dir is not None:
+            self._override_train_image_paths(cfg.train_image_dir)
+
+        if cfg.coarse_init_ply is not None:
+            pts, rgb = self._load_points_from_ply(cfg.coarse_init_ply)
+            print(
+                f"[coarse_init_ply] Replacing parser points ({len(self.parser.points):,}) "
+                f"with {len(pts):,} points from: {cfg.coarse_init_ply}"
+            )
+            self.parser.points = pts
+            self.parser.points_rgb = rgb
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -780,6 +803,76 @@ class Runner:
     ) -> Tuple[float, float]:
         scales = splats["scales"].detach()
         return scales.mean().item(), scales.std(unbiased=False).clamp_min(1e-6).item()
+
+    def _override_train_image_paths(self, train_image_dir: str) -> None:
+        """Replace parser image paths with images from train_image_dir.
+
+        File names are matched by basename, so the override directory must
+        contain images with the same filenames as the original dataset.
+        """
+        img_dir = Path(train_image_dir)
+        if not img_dir.exists():
+            raise ValueError(f"train_image_dir does not exist: {train_image_dir}")
+        EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+        name_to_path: Dict[str, str] = {}
+        for p in sorted(img_dir.rglob("*")):
+            if p.suffix.lower() in EXTS:
+                name_to_path[p.name] = str(p)
+                name_to_path[p.stem] = str(p)  # stem fallback for extension mismatches
+        new_paths = []
+        for orig in self.parser.image_paths:
+            orig_name = Path(orig).name
+            orig_stem = Path(orig).stem
+            if orig_name in name_to_path:
+                new_paths.append(name_to_path[orig_name])
+            elif orig_stem in name_to_path:
+                new_paths.append(name_to_path[orig_stem])
+            else:
+                sample = sorted(name_to_path.keys())[:5]
+                raise ValueError(
+                    f"No matching image for '{orig_name}' in {train_image_dir}. "
+                    f"Sample available: {sample}"
+                )
+        print(
+            f"[train_image_dir] Overriding {len(new_paths)} image paths "
+            f"with images from: {train_image_dir}"
+        )
+        self.parser.image_paths = new_paths
+
+    def _load_points_from_ply(self, ply_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Read a point-cloud PLY (binary or ASCII) written by tools/downsample_pointcloud.py.
+        Returns (N,3) float32 xyz and (N,3) uint8 rgb.
+        """
+        path = Path(ply_path)
+        if not path.exists():
+            raise ValueError(f"coarse_init_ply does not exist: {ply_path}")
+        with open(path, "rb") as f:
+            header: list[str] = []
+            while True:
+                line = f.readline().decode("ascii").strip()
+                header.append(line)
+                if line == "end_header":
+                    break
+            n = int(next(l.split()[-1] for l in header if l.startswith("element vertex")))
+            is_binary = any("binary_little_endian" in l for l in header)
+            if is_binary:
+                dt = np.dtype([
+                    ("x", np.float32), ("y", np.float32), ("z", np.float32),
+                    ("red", np.uint8), ("green", np.uint8), ("blue", np.uint8),
+                ])
+                data = np.frombuffer(f.read(n * dt.itemsize), dtype=dt)
+            else:
+                rows = [f.readline().decode("ascii").split() for _ in range(n)]
+                arr = np.array(rows, dtype=np.float32)
+                dt = None
+                data = arr
+        if is_binary:
+            points = np.stack([data["x"], data["y"], data["z"]], axis=1).copy().astype(np.float32)
+            colors = np.stack([data["red"], data["green"], data["blue"]], axis=1).copy().astype(np.uint8)
+        else:
+            points = data[:, :3].astype(np.float32)
+            colors = data[:, 3:6].astype(np.uint8)
+        return points, colors
 
     def _band_counts(self) -> Dict[str, int]:
         if not self.cfg.progressive:
@@ -1431,6 +1524,9 @@ class Runner:
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
+        if cfg.coarse_only:
+            max_steps = min(max_steps, cfg.stage_steps[0])
+            print(f"[coarse_only] Training capped at {max_steps} steps (coarse stage only).")
         init_step = 0
 
         schedulers = [
