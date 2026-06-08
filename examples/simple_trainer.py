@@ -210,6 +210,12 @@ class Config:
     spawn_score_alpha: float = 1.0
     spawn_score_beta: float = 0.5
     spawn_score_gamma: float = 0.1
+    # Weight for LoG-based high-frequency score in spawn selection.
+    # Positive values bias spawning toward high-frequency image regions,
+    # ensuring child Gaussians cover detail that the parent band cannot.
+    spawn_score_delta: float = 0.3
+    # Sigma values for the multi-scale Laplacian-of-Gaussian frequency map.
+    log_sigma_scales: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
     spawn_window: int = 3
     # Stop training after the coarse band stage (requires progressive=True).
     coarse_only: bool = False
@@ -337,6 +343,38 @@ class Config:
 
 
 PROGRESSIVE_BANDS = ("coarse", "mid", "fine")
+
+
+def _make_log_kernel(sigma: float, size: int, device: torch.device) -> Tensor:
+    """Laplacian-of-Gaussian kernel, shape [1, 1, size, size], zero-summed."""
+    coords = torch.arange(size, device=device).float() - size // 2
+    y, x = torch.meshgrid(coords, coords, indexing="ij")
+    r2 = x**2 + y**2
+    sigma2 = sigma**2
+    kernel = (r2 - 2.0 * sigma2) / (sigma2**2) * torch.exp(-r2 / (2.0 * sigma2))
+    kernel = kernel - kernel.mean()
+    return kernel.unsqueeze(0).unsqueeze(0)
+
+
+@torch.no_grad()
+def compute_log_freq_map(
+    image: Tensor,
+    sigmas: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0),
+) -> Tensor:
+    """
+    Per-pixel high-frequency indicator via max LoG response across scales.
+    image: [1, H, W, 3] or [H, W, 3], values in [0, 1].
+    Returns [H, W] map in [0, 1], where 1 = high-frequency region.
+    """
+    img = image[0] if image.dim() == 4 else image          # [H, W, 3]
+    gray = img.mean(dim=-1).unsqueeze(0).unsqueeze(0)      # [1, 1, H, W]
+    max_resp = torch.zeros(gray.shape[2:], device=image.device)
+    for sigma in sigmas:
+        ksize = int(6 * sigma + 1) | 1
+        kernel = _make_log_kernel(sigma, ksize, image.device)
+        resp = F.conv2d(gray, kernel, padding=ksize // 2).abs()[0, 0]
+        max_resp = torch.maximum(max_resp, resp)
+    return max_resp / max_resp.max().clamp_min(1e-6)
 
 
 def get_progressive_stage(step: int, cfg: Config) -> str:
@@ -996,6 +1034,16 @@ class Runner:
         residual_map = l1_loss(colors.detach(), pixels.detach()).mean(dim=-1)[0]
         residual_score = torch.zeros(active_n, device=colors.device)
         gradient_score = torch.zeros(active_n, device=colors.device)
+        freq_score = torch.zeros(active_n, device=colors.device)
+
+        # LoG frequency map: high values indicate fine-detail regions that
+        # the current band (large Gaussians) cannot resolve well. Used to
+        # bias spawning of the next-finer band toward those regions.
+        freq_map: Optional[Tensor] = None
+        if self.cfg.spawn_score_delta > 0.0:
+            freq_map = compute_log_freq_map(
+                pixels.detach(), self.cfg.log_sigma_scales
+            )
 
         means2d = info.get("means2d")
         radii = info.get("radii")
@@ -1026,6 +1074,14 @@ class Runner:
                         gradient_score.index_add_(0, local_ids, grad_norm)
                         grad_counts.index_add_(0, local_ids, torch.ones_like(grad_norm))
                         gradient_score = gradient_score / grad_counts.clamp_min(1.0)
+                    if freq_map is not None:
+                        freq_sampled = self._sample_residual_at_centers(
+                            freq_map, centers, visible, width, height
+                        )
+                        freq_counts = torch.zeros(active_n, device=colors.device)
+                        freq_score.index_add_(0, local_ids, freq_sampled)
+                        freq_counts.index_add_(0, local_ids, torch.ones_like(freq_sampled))
+                        freq_score = freq_score / freq_counts.clamp_min(1.0)
             else:
                 centers = means2d[..., start:end, :].reshape(-1, active_n, 2)[0]
                 visible = (radii[..., start:end, :] > 0.0).all(dim=-1).reshape(
@@ -1037,6 +1093,10 @@ class Runner:
                 if grad_source is not None:
                     gradient_score = grad_source[..., start:end, :].norm(dim=-1)
                     gradient_score = gradient_score.reshape(-1, active_n).mean(dim=0)
+                if freq_map is not None:
+                    freq_score = self._sample_residual_at_centers(
+                        freq_map, centers, visible, width, height
+                    )
 
         opacity_score = torch.sigmoid(self.band_splats[band]["opacities"].detach())
         if opacity_score.numel() != active_n:
@@ -1045,6 +1105,7 @@ class Runner:
             self.cfg.spawn_score_alpha * residual_score
             + self.cfg.spawn_score_beta * gradient_score
             + self.cfg.spawn_score_gamma * opacity_score.flatten()
+            + self.cfg.spawn_score_delta * freq_score
         )
         self.progressive_spawn_scores[band] = torch.nan_to_num(score.detach(), nan=0.0)
 
