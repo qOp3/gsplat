@@ -82,7 +82,12 @@ echo "  GPU     : ${GPU}"
 echo "  results : ${RESULT_ROOT}"
 echo ""
 
+ONLY="${ONLY:-}"   # e.g. ONLY=freq_spawn_d0.3 to run a single experiment
 for name in baseline freq_spawn_d0.3; do
+    if [ -n "${ONLY}" ] && [ "${name}" != "${ONLY}" ]; then
+        echo "[SKIP] ${name}: not in ONLY=${ONLY}"
+        continue
+    fi
     run_experiment "${name}" "${EXPERIMENTS[$name]}"
 done
 
