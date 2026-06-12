@@ -104,6 +104,9 @@ class Config:
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # Resume training from a progressive checkpoint (e.g., a coarse-only .pt file).
+    # Loads band splats and continues from the saved step; optimizer state is reset.
+    resume_ckpt: Optional[str] = None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path: "interp", "ellipse", "spiral", or "raw" (use captured poses as-is)
@@ -1632,6 +1635,17 @@ class Runner:
             print(f"[coarse_only] Training capped at {max_steps} steps (coarse stage only).")
         init_step = 0
 
+        if cfg.resume_ckpt is not None:
+            ckpt = torch.load(cfg.resume_ckpt, map_location=self.device, weights_only=True)
+            if not ckpt.get("progressive", False):
+                raise ValueError("resume_ckpt only supports progressive checkpoints.")
+            self.load_progressive_checkpoint([ckpt])
+            init_step = ckpt["step"] + 1
+            print(
+                f"[resume] Loaded checkpoint from {cfg.resume_ckpt} "
+                f"(stage={ckpt.get('stage', '?')}, resuming at step {init_step})"
+            )
+
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
@@ -1669,6 +1683,12 @@ class Runner:
                 max_optimization_iters=max_steps,
             )
             schedulers.extend(ppisp_schedulers)
+
+        if init_step > 0:
+            # Fast-forward LR schedulers to match the resumed step.
+            for scheduler in schedulers:
+                for _ in range(init_step):
+                    scheduler.step()
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,

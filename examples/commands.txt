@@ -63,11 +63,57 @@ MAX_JOBS=4 CUDA_VISIBLE_DEVICES=0 python -m examples.simple_trainer default \
   --disable_viewer
 
 
+# ── 两阶段训练：先 coarse，后 mid+fine ──────────────────────────────────────
+
+# 第一阶段：只训练 coarse，保存 ckpt（约 5000 步）
+MAX_JOBS=4 CUDA_VISIBLE_DEVICES=0 python -m examples.simple_trainer default \
+  --data_dir data/grape \
+  --data_factor 4 \
+  --result_dir results/grape_coarse_stage \
+  --max_steps 30000 \
+  --packed \
+  --progressive \
+  --coarse_only \
+  --stage_steps 5000 17000 27000 \
+  --coarse_init_scale_mult 2.5 \
+  --coarse_ssim_lambda 0.10 \
+  --band_range_reg 0.01 \
+  --spawn_score_delta 0.3 \
+  --coarse_prune_keep_ratio 0.6 \
+  --no-normalize_world_space \
+  --disable_viewer
+
+# 第二阶段：从 coarse ckpt 继续训练 mid+fine
+# 把上面保存的 ckpt 路径填入 --resume_ckpt
+MAX_JOBS=4 CUDA_VISIBLE_DEVICES=0 python -m examples.simple_trainer default \
+  --data_dir data/grape \
+  --data_factor 4 \
+  --result_dir results/grape_mid_fine_stage \
+  --max_steps 30000 \
+  --packed \
+  --progressive \
+  --resume_ckpt results/grape_coarse_stage/ckpts/ckpt_4999_rank0.pt \
+  --stage_steps 5000 17000 27000 \
+  --coarse_init_scale_mult 2.5 \
+  --mid_spawn_scale_mult 0.6 \
+  --fine_spawn_scale_mult 0.25 \
+  --coarse_ssim_lambda 0.10 \
+  --mid_ssim_lambda 0.20 \
+  --fine_ssim_lambda 0.25 \
+  --fine_absgrad \
+  --fine_grow_grad2d 0.0008 \
+  --band_range_reg 0.01 \
+  --spawn_score_delta 0.3 \
+  --coarse_prune_keep_ratio 0.6 \
+  --no-normalize_world_space \
+  --disable_viewer
+
+
 # 导出各 band 的 PLY 文件
 
 python tools/visualize_bands.py \
-    --ckpt results/garden/ckpts/ckpt_29999_rank0.pt \
-    --output-dir results/garden/bands
+    --ckpt gsplat/results/ablation_freq_spawn/baseline/ckpts/ckpt_29999_rank0.pt \
+    --output-dir results/ablation_freq_spawn/baseline/bands
 
 # 输出文件：
 #   coarse.ply, mid.ply, fine.ply  -- 每个 band 对应一个 PLY
