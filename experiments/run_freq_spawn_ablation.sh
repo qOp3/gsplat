@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Ablation: baseline vs. LoG frequency-adaptive spawn scoring.
+# Ablation: baseline vs. LoG frequency-adaptive spawn scoring + coarse pruning.
 # Run from the gsplat/ repo root:
 #   bash experiments/run_freq_spawn_ablation.sh
 # Override defaults via env vars:
 #   DATA_DIR=data/garden GPU=1 bash experiments/run_freq_spawn_ablation.sh
+# Run a single experiment:
+#   ONLY=freq_spawn_prune bash experiments/run_freq_spawn_ablation.sh
 
 set -euo pipefail
 
@@ -38,9 +40,18 @@ COMMON_ARGS=(
     --disable_viewer
 )
 
+# Experiments: name -> extra args
+# baseline          : no freq score, no coarse pruning
+# freq_spawn        : LoG freq score only
+# coarse_prune      : coarse pruning only
+# freq_spawn_prune  : LoG freq score + coarse pruning (full method)
 declare -A EXPERIMENTS
-EXPERIMENTS["baseline"]="--spawn_score_delta 0.0"
-EXPERIMENTS["freq_spawn_d0.3"]="--spawn_score_delta 0.3"
+EXPERIMENTS["baseline"]="--spawn_score_delta 0.0 --coarse_prune_keep_ratio 1.0"
+EXPERIMENTS["freq_spawn"]="--spawn_score_delta 0.3 --coarse_prune_keep_ratio 1.0"
+EXPERIMENTS["coarse_prune"]="--spawn_score_delta 0.0 --coarse_prune_keep_ratio 0.6"
+EXPERIMENTS["freq_spawn_prune"]="--spawn_score_delta 0.3 --coarse_prune_keep_ratio 0.6"
+
+EXPERIMENT_ORDER="baseline freq_spawn coarse_prune freq_spawn_prune"
 
 run_experiment() {
     local name="$1"
@@ -75,15 +86,15 @@ run_experiment() {
     echo "  finished at $(date '+%Y-%m-%d %H:%M:%S')"
 }
 
-echo "Ablation: freq-adaptive spawn scoring"
+echo "Ablation: freq-adaptive spawn scoring + coarse pruning"
 echo "  data    : ${DATA_DIR} (factor ${DATA_FACTOR})"
 echo "  steps   : ${MAX_STEPS}"
 echo "  GPU     : ${GPU}"
 echo "  results : ${RESULT_ROOT}"
 echo ""
 
-ONLY="${ONLY:-}"   # e.g. ONLY=freq_spawn_d0.3 to run a single experiment
-for name in baseline freq_spawn_d0.3; do
+ONLY="${ONLY:-}"
+for name in ${EXPERIMENT_ORDER}; do
     if [ -n "${ONLY}" ] && [ "${name}" != "${ONLY}" ]; then
         echo "[SKIP] ${name}: not in ONLY=${ONLY}"
         continue
@@ -95,13 +106,14 @@ echo ""
 echo "All experiments done."
 echo "Results under: ${RESULT_ROOT}/"
 echo ""
-echo "Quick PSNR summary (last eval line per run):"
-for name in baseline freq_spawn_d0.3; do
+echo "Quick PSNR summary (last eval per run):"
+for name in ${EXPERIMENT_ORDER}; do
     log="${LOG_DIR}/${name}.log"
     if [ -f "${log}" ]; then
         last=$(grep -oP 'PSNR: \K[0-9.]+' "${log}" | tail -1)
         ssim=$(grep -oP 'SSIM: \K[0-9.]+' "${log}" | tail -1)
         lpips=$(grep -oP 'LPIPS: \K[0-9.]+' "${log}" | tail -1)
-        echo "  ${name}: PSNR=${last:-N/A}  SSIM=${ssim:-N/A}  LPIPS=${lpips:-N/A}"
+        printf "  %-20s PSNR=%-7s SSIM=%-7s LPIPS=%s\n" \
+            "${name}" "${last:-N/A}" "${ssim:-N/A}" "${lpips:-N/A}"
     fi
 done

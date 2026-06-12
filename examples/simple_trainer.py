@@ -217,6 +217,10 @@ class Config:
     # Sigma values for the multi-scale Laplacian-of-Gaussian frequency map.
     log_sigma_scales: Tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
     spawn_window: int = 3
+    # Fraction of coarse splats to keep (by smallest scale) before spawning mid.
+    # Large coarse splats are removed to avoid occluding finer-band splats.
+    # Set to 1.0 to disable pruning.
+    coarse_prune_keep_ratio: float = 0.6
     # Stop training after the coarse band stage (requires progressive=True).
     coarse_only: bool = False
     # Override training image directory (e.g., point to FFT low-freq output).
@@ -1181,10 +1185,48 @@ class Runner:
             f"score_max={selected_scores.max().item():.6f}"
         )
 
+    @torch.no_grad()
+    def prune_coarse_band(self) -> None:
+        keep_ratio = self.cfg.coarse_prune_keep_ratio
+        if keep_ratio >= 1.0:
+            return
+        splats = self.band_splats["coarse"]
+        n = splats["means"].shape[0]
+        # Sort by largest axis of each Gaussian's scale ellipsoid; keep smallest k.
+        max_scale = splats["scales"].detach().exp().max(dim=-1).values
+        k = max(1, int(n * keep_ratio))
+        _, sel = torch.topk(max_scale, k=k, largest=False, sorted=False)
+        sel, _ = sel.sort()
+
+        new_splats = torch.nn.ParameterDict()
+        for key, val in splats.items():
+            new_splats[key] = torch.nn.Parameter(
+                val.detach()[sel].clone(), requires_grad=True
+            )
+        self.band_splats["coarse"] = new_splats
+        self.band_optimizers["coarse"] = create_optimizers_for_splats(
+            new_splats,
+            self._splat_lrs(),
+            sparse_grad=False,
+            visible_adam=self.cfg.visible_adam,
+            batch_size=self.cfg.batch_size,
+            world_size=self.world_size,
+        )
+        self.band_strategy_state["coarse"] = self.band_strategies[
+            "coarse"
+        ].initialize_state(scene_scale=self.scene_scale)
+        self.band_scale_stats["coarse"] = self._band_scale_stats(new_splats)
+        self.progressive_spawn_scores.pop("coarse", None)
+        print(
+            f"[Progressive] Pruned coarse band: {n} -> {sel.shape[0]} splats "
+            f"(keep_ratio={keep_ratio:.2f}, removed {n - sel.shape[0]} large splats)"
+        )
+
     def prepare_progressive_stage(self, step: int) -> Tuple[str, str]:
         stage = get_progressive_stage(step, self.cfg)
         active_band = "fine" if stage == "polish" else stage
         if stage == "mid" and "mid" not in self.band_splats:
+            self.prune_coarse_band()
             self.freeze_band("coarse")
             self.spawn_band_from_parent("mid", "coarse", self.cfg.mid_spawn_scale_mult)
         elif stage == "fine" and "fine" not in self.band_splats:
