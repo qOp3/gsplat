@@ -224,6 +224,27 @@ class Config:
     # Large coarse splats are removed to avoid occluding finer-band splats.
     # Set to 1.0 to disable pruning.
     coarse_prune_keep_ratio: float = 0.6
+
+    # ── Wavelet frequency map guidance ────────────────────────────────────────
+    # Directory produced by image_processing/wavelet_freq_map.py.
+    # When set, per-image wavelet maps replace the on-the-fly LoG score and
+    # enable frequency-aware pruning and scale-loss modulation.
+    # Set to None to run identically to simple_trainer (no freq guidance).
+    freq_map_dir: Optional[str] = None
+    # Wavelet level used for spawn scoring per band (L1=finest, L4=coarsest).
+    # Tuple order: (coarse_band_level, mid_band_level, fine_band_level).
+    freq_spawn_levels: Tuple[int, int, int] = (3, 2, 1)
+    # Weight of the wavelet frequency term in spawn scoring.
+    # Replaces spawn_score_delta when freq_map_dir is set.
+    freq_spawn_weight: float = 0.4
+    # Freq-aware coarse pruning: large Gaussians in high-freq regions are
+    # pruned first; large Gaussians in low-freq structure are preserved.
+    freq_prune: bool = True
+    # Modulate per-Gaussian upper scale bound in band_range_loss using the
+    # accumulated spawn scores (proxy for local frequency content).
+    freq_range_reg: bool = True
+    # Strength of the freq modulation on scale bounds [0=off, 1=full shift].
+    freq_range_strength: float = 0.5
     # Stop training after the coarse band stage (requires progressive=True).
     coarse_only: bool = False
     # Override training image directory (e.g., point to FFT low-freq output).
@@ -382,6 +403,82 @@ def compute_log_freq_map(
         resp = F.conv2d(gray, kernel, padding=ksize // 2).abs()[0, 0]
         max_resp = torch.maximum(max_resp, resp)
     return max_resp / max_resp.max().clamp_min(1e-6)
+
+
+class FreqMapLoader:
+    """
+    Lazy-loading cache for precomputed wavelet frequency maps.
+
+    Maps are produced by image_processing/wavelet_freq_map.py and stored as
+    8-bit grayscale PNGs named  <stem>_wl_L<level>.png  and
+    <stem>_wl_combined.png  inside freq_map_dir.
+
+    All maps are resized to the requested target resolution on first access
+    and kept on the given device.
+    """
+
+    def __init__(
+        self,
+        freq_map_dir: Path,
+        image_paths: List[str],
+        device: torch.device,
+    ) -> None:
+        self.freq_map_dir = Path(freq_map_dir)
+        self.device = device
+        # image_id (int) → stem string  (e.g. "050")
+        self._id_to_stem: Dict[int, str] = {
+            i: Path(p).stem for i, p in enumerate(image_paths)
+        }
+        # Cache: (stem, suffix, H, W) → Tensor [H, W] float32 [0,1]
+        self._cache: Dict[tuple, Optional[Tensor]] = {}
+
+    def _load(
+        self,
+        stem: str,
+        suffix: str,
+        target_hw: Tuple[int, int],
+    ) -> Optional[Tensor]:
+        """Read one PNG, resize to (H, W), return float32 Tensor on device."""
+        import cv2 as _cv2
+        path = self.freq_map_dir / f"{stem}_{suffix}.png"
+        if not path.exists():
+            return None
+        img = _cv2.imread(str(path), _cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return None
+        H, W = target_hw
+        if img.shape != (H, W):
+            img = _cv2.resize(img, (W, H), interpolation=_cv2.INTER_LINEAR)
+        return torch.from_numpy(img.astype(np.float32) / 255.0).to(self.device)
+
+    def _get(self, stem: str, suffix: str, target_hw: Tuple[int, int]) -> Optional[Tensor]:
+        key = (stem, suffix, target_hw[0], target_hw[1])
+        if key not in self._cache:
+            self._cache[key] = self._load(stem, suffix, target_hw)
+        return self._cache[key]
+
+    def level_map(
+        self,
+        image_id: int,
+        level: int,
+        target_hw: Tuple[int, int],
+    ) -> Optional[Tensor]:
+        """Return wavelet detail-energy map for the given level (1=finest)."""
+        stem = self._id_to_stem.get(image_id)
+        if stem is None:
+            return None
+        return self._get(stem, f"wl_L{level}", target_hw)
+
+    def combined_map(
+        self,
+        image_id: int,
+        target_hw: Tuple[int, int],
+    ) -> Optional[Tensor]:
+        """Return weighted-sum frequency map (all levels combined)."""
+        stem = self._id_to_stem.get(image_id)
+        if stem is None:
+            return None
+        return self._get(stem, "wl_combined", target_hw)
 
 
 def get_progressive_stage(step: int, cfg: Config) -> str:
@@ -583,6 +680,19 @@ class Runner:
             self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+
+        # Wavelet frequency map loader — None when freq_map_dir is not set.
+        self.freq_loader: Optional[FreqMapLoader] = None
+        if cfg.freq_map_dir is not None:
+            self.freq_loader = FreqMapLoader(
+                freq_map_dir=Path(cfg.freq_map_dir),
+                image_paths=self.parser.image_paths,
+                device=self.device,
+            )
+            print(
+                f"[FreqMap] Loaded index for {len(self.parser.image_paths)} images "
+                f"from {cfg.freq_map_dir}"
+            )
 
         if self.parser.num_cameras > 1 and cfg.batch_size != 1:
             raise ValueError(
@@ -1029,6 +1139,7 @@ class Runner:
         colors: Tensor,
         pixels: Tensor,
         info: Dict[str, Any],
+        image_ids: Optional[Tensor] = None,
     ) -> None:
         if band not in self.band_splats:
             return
@@ -1043,11 +1154,19 @@ class Runner:
         gradient_score = torch.zeros(active_n, device=colors.device)
         freq_score = torch.zeros(active_n, device=colors.device)
 
-        # LoG frequency map: high values indicate fine-detail regions that
-        # the current band (large Gaussians) cannot resolve well. Used to
-        # bias spawning of the next-finer band toward those regions.
+        # Frequency map: wavelet (precomputed) when freq_map_dir is set,
+        # otherwise fall back to on-the-fly LoG from simple_trainer.
         freq_map: Optional[Tensor] = None
-        if self.cfg.spawn_score_delta > 0.0:
+        freq_weight = self.cfg.spawn_score_delta  # default: LoG weight
+        if self.freq_loader is not None and self.cfg.freq_spawn_weight > 0.0:
+            band_idx = PROGRESSIVE_BANDS.index(band)
+            level = self.cfg.freq_spawn_levels[band_idx]
+            if image_ids is not None:
+                freq_map = self.freq_loader.level_map(
+                    image_ids[0].item(), level, (height, width)
+                )
+            freq_weight = self.cfg.freq_spawn_weight
+        elif self.cfg.spawn_score_delta > 0.0:
             freq_map = compute_log_freq_map(
                 pixels.detach(), self.cfg.log_sigma_scales
             )
@@ -1112,7 +1231,7 @@ class Runner:
             self.cfg.spawn_score_alpha * residual_score
             + self.cfg.spawn_score_beta * gradient_score
             + self.cfg.spawn_score_gamma * opacity_score.flatten()
-            + self.cfg.spawn_score_delta * freq_score
+            + freq_weight * freq_score
         )
         self.progressive_spawn_scores[band] = torch.nan_to_num(score.detach(), nan=0.0)
 
@@ -1195,10 +1314,35 @@ class Runner:
             return
         splats = self.band_splats["coarse"]
         n = splats["means"].shape[0]
-        # Sort by largest axis of each Gaussian's scale ellipsoid; keep smallest k.
-        max_scale = splats["scales"].detach().exp().max(dim=-1).values
+        max_scale = splats["scales"].detach().exp().max(dim=-1).values  # (N,)
+
+        # Freq-aware pruning: large Gaussians in high-freq regions should be
+        # removed first (child band will cover them); large Gaussians in
+        # low-freq smooth regions should be preserved (they encode structure).
+        # We adjust the pruning score by subtracting a bias for Gaussians
+        # whose accumulated spawn score is LOW (= low-freq = keep them).
+        spawn_scores = self.progressive_spawn_scores.get("coarse")
+        if (
+            self.freq_loader is not None
+            and self.cfg.freq_prune
+            and spawn_scores is not None
+            and spawn_scores.numel() == n
+        ):
+            scores_norm = spawn_scores.to(max_scale.device)
+            s_min, s_max = scores_norm.min(), scores_norm.max()
+            if s_max - s_min > 1e-6:
+                scores_norm = (scores_norm - s_min) / (s_max - s_min)
+            # Pruning key: larger = more likely to be removed.
+            # High spawn score (high freq) + large scale → pruned first.
+            # Low spawn score (low freq) + large scale → kept.
+            prune_key = max_scale * (0.5 + 0.5 * scores_norm)
+            score_source = "scale × freq"
+        else:
+            prune_key = max_scale
+            score_source = "scale"
+
         k = max(1, int(n * keep_ratio))
-        _, sel = torch.topk(max_scale, k=k, largest=False, sorted=False)
+        _, sel = torch.topk(prune_key, k=k, largest=False, sorted=False)
         sel, _ = sel.sort()
 
         new_splats = torch.nn.ParameterDict()
@@ -1222,7 +1366,8 @@ class Runner:
         self.progressive_spawn_scores.pop("coarse", None)
         print(
             f"[Progressive] Pruned coarse band: {n} -> {sel.shape[0]} splats "
-            f"(keep_ratio={keep_ratio:.2f}, removed {n - sel.shape[0]} large splats)"
+            f"(keep_ratio={keep_ratio:.2f}, criterion={score_source}, "
+            f"removed {n - sel.shape[0]} splats)"
         )
 
     def prepare_progressive_stage(self, step: int) -> Tuple[str, str]:
@@ -1294,6 +1439,30 @@ class Runner:
         min_log_scale = mean_log_scale + math.log(lo)
         max_log_scale = mean_log_scale + math.log(hi)
         log_scales = self.band_splats[band]["scales"]
+
+        # Freq-aware scale modulation: Gaussians whose accumulated spawn score
+        # indicates high-frequency content get a tighter upper scale bound,
+        # pushing them to stay small. Low-freq Gaussians keep the full range.
+        spawn_scores = self.progressive_spawn_scores.get(band)
+        if (
+            self.freq_loader is not None
+            and self.cfg.freq_range_reg
+            and self.cfg.freq_range_strength > 0.0
+            and spawn_scores is not None
+            and spawn_scores.numel() == log_scales.shape[0]
+        ):
+            s = spawn_scores.detach().to(log_scales.device)
+            s_min, s_max = s.min(), s.max()
+            if s_max - s_min > 1e-6:
+                s = (s - s_min) / (s_max - s_min)  # [0, 1], 1 = high freq
+            # High-freq Gaussians: tighten upper bound by up to freq_range_strength×log(hi/lo)
+            shift = self.cfg.freq_range_strength * math.log(hi / lo) * s
+            adaptive_max = (max_log_scale - shift).clamp_min(min_log_scale + 0.1)
+            return (
+                F.relu(min_log_scale - log_scales).mean()
+                + F.relu(log_scales - adaptive_max).mean()
+            )
+
         return (
             F.relu(min_log_scale - log_scales).mean()
             + F.relu(log_scales - max_log_scale).mean()
@@ -1893,7 +2062,7 @@ class Runner:
 
             loss.backward()
             if cfg.progressive and active_band is not None and stage != "polish":
-                self.update_spawn_scores(active_band, colors, pixels, info)
+                self.update_spawn_scores(active_band, colors, pixels, info, image_ids=image_ids)
 
             desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
