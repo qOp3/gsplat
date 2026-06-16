@@ -128,3 +128,35 @@ python tools/visualize_bands.py \
 #   --skip-plots  跳过 matplotlib 图表生成
 
 # 注意：普通（非 progressive）checkpoint 只导出 coarse.ply，内容为全部 splats
+
+
+# ── Wavelet 引导的 freq_trainer 训练 ─────────────────────────────────────────
+# 前置步骤（每个数据集只需运行一次）：
+#   python image_processing/wavelet_freq_map.py \
+#       --input  gsplat/data/<dataset>/images_4 \
+#       --output frequency_maps/<dataset>_wavelet \
+#       --levels 4 --wavelet db2 --heatmap
+
+# grape（wavelet 图已存在）
+DATA_DIR=data/grape \
+DATA_FACTOR=4 \
+FREQ_MAP_DIR=../../frequency_maps/grape_wavelet \
+RESULT_DIR=results/grape_freq \
+STAGE_STEPS="5000 17000 27000" \
+MAX_STEPS=30000 \
+GPU=0 \
+bash experiments/run_freq_trainer.sh
+
+# blackberry（wavelet 图已存在，images_4 已生成）
+DATA_DIR=data/blackberry \
+DATA_FACTOR=4 \
+FREQ_MAP_DIR=../../frequency_maps/blackberry_wavelet \
+RESULT_DIR=results/blackberry_freq \
+STAGE_STEPS="5000 17000 27000" \
+MAX_STEPS=30000 \
+GPU=0 \
+bash experiments/run_freq_trainer.sh
+
+# 两个数据集并行（需要两张 GPU）
+DATA_DIR=data/grape       FREQ_MAP_DIR=../../frequency_maps/grape_wavelet      RESULT_DIR=results/grape_freq      GPU=0 bash experiments/run_freq_trainer.sh &
+DATA_DIR=data/blackberry  FREQ_MAP_DIR=../../frequency_maps/blackberry_wavelet  RESULT_DIR=results/blackberry_freq  GPU=1 bash experiments/run_freq_trainer.sh &

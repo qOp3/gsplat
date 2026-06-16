@@ -1458,6 +1458,7 @@ class Runner:
             # High-freq Gaussians: tighten upper bound by up to freq_range_strength×log(hi/lo)
             shift = self.cfg.freq_range_strength * math.log(hi / lo) * s
             adaptive_max = (max_log_scale - shift).clamp_min(min_log_scale + 0.1)
+            adaptive_max = adaptive_max.unsqueeze(-1)  # (N,) → (N, 1) to broadcast over 3 axes
             return (
                 F.relu(min_log_scale - log_scales).mean()
                 + F.relu(log_scales - adaptive_max).mean()
