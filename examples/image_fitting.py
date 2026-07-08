@@ -124,7 +124,7 @@ class SimpleTrainer:
                 self.quats / self.quats.norm(dim=-1, keepdim=True),
                 self.scales,
                 torch.sigmoid(self.opacities),
-                torch.sigmoid(self.rgbs),
+                torch.sigmoid(self.rgbs)[None],
                 self.viewmat[None],
                 K[None],
                 self.W,
